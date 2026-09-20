@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.scripts]
-robot-hackathon = "robot_hackathon:main"
+robot-hackathon = "robot_hackathon.main:main"
 
 [build-system]
 requires = ["uv_build>=0.12.11,<0.13.0"]
