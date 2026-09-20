@@ -1,12 +1,12 @@
 """
-test_policy_integration.py — SIMULATED robot + REAL policy API.
+test_policy_integration.py — SIMULATED robot + REAL OpenPI inference endpoint.
 
-The SO-101 hardware is mocked (no serial port, no camera), but the policy
-HTTP calls go to the REAL pi05_base REST endpoint instead of a mock server.
+The SO-101 hardware is mocked (no serial port, no camera), but the inference
+HTTP calls go to the REAL OpenPI /act endpoint.
 
-Skipped by default — enable by setting POLICY_URL:
+Skipped by default — enable by setting INFERENCE_URL:
 
-    POLICY_URL=http://127.0.0.1:8000 \
+    INFERENCE_URL=http://127.0.0.1:8000 \
     POLICY_TASK="pick up the red cube" \
         uv run pytest tests/test_policy_integration.py -v -s
 """
@@ -14,12 +14,13 @@ Skipped by default — enable by setting POLICY_URL:
 import math
 import os
 import time
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import requests
 
-# --- import the script under test (now main.py) ---
+# --- import the script under test ---
 try:
     from robot_hackathon import main as m
 except ImportError:
@@ -40,7 +41,7 @@ JOINTS = [
     "gripper",
 ]
 
-POLICY_URL = os.environ.get("POLICY_URL")  # e.g. http://127.0.0.1:8000
+INFERENCE_URL = os.environ.get("INFERENCE_URL") or os.environ.get("POLICY_URL")
 POLICY_TASK = os.environ.get("POLICY_TASK", "pick up the red cube")
 REQUEST_TIMEOUT = 15.0  # real inference (and first-call model warmup) can be slow
 
@@ -48,8 +49,7 @@ pytestmark = pytest.mark.integration
 
 
 # --------------------------------------------------------------------------- #
-#  Simulated hardware (same fakes as test_read_so101.py — consider moving     #
-#  them into tests/conftest.py to share between both files)                   #
+#  Simulated hardware                                                         #
 # --------------------------------------------------------------------------- #
 
 
@@ -108,14 +108,14 @@ class MockSO101Leader:
 
 @pytest.fixture(scope="module")
 def real_policy():
-    """Skip unless POLICY_URL is set AND the server answers."""
-    if not POLICY_URL:
-        pytest.skip("set POLICY_URL=http://host:port to run this integration test")
+    """Skip unless INFERENCE_URL is set AND the server answers."""
+    if not INFERENCE_URL:
+        pytest.skip("set INFERENCE_URL=http://host:port to run this integration test")
     try:
-        requests.get(POLICY_URL, timeout=3)  # any HTTP response = server is up
+        requests.get(INFERENCE_URL, timeout=3)  # any HTTP response = server is up
     except requests.RequestException as e:
-        pytest.skip(f"policy server at {POLICY_URL} unreachable: {e}")
-    return POLICY_URL
+        pytest.skip(f"inference server at {INFERENCE_URL} unreachable: {e}")
+    return INFERENCE_URL
 
 
 @pytest.fixture
@@ -165,7 +165,7 @@ def assert_valid_action(action: dict):
 
 def test_real_policy_returns_valid_action(real_policy):
     """Direct client call: simulated observation -> real server -> valid action."""
-    cfg = m.SOFollowerRobotConfig(
+    cfg = SimpleNamespace(
         port=m.FOLLOWER_PORT, id="integration-test", cameras=m.CAMERAS
     )
     robot = MockSO101Follower(cfg)
@@ -188,7 +188,6 @@ def test_real_policy_returns_valid_action(real_policy):
 
 def test_main_loop_against_real_policy(mock_hw, monkeypatch, real_policy):
     """Full pipeline: main.py loop with simulated arm driven by the real API."""
-    # give the real server more headroom than the built-in 1s timeout
     real_client_cls = m.PolicyClient
     monkeypatch.setattr(
         m,
@@ -200,7 +199,7 @@ def test_main_loop_against_real_policy(mock_hw, monkeypatch, real_policy):
 
     run_main(
         monkeypatch,
-        argv=["--policy-url", real_policy, "--policy-task", POLICY_TASK],
+        argv=["--inference-url", real_policy, "--policy-task", POLICY_TASK],
         iterations=3,
     )
 

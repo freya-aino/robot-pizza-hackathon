@@ -1,19 +1,22 @@
-"""read_so101.py — read ALL data (camera frames + motor positions) from a
-LeRobot SO-101 follower arm as a plain Python dict.
-
-lerobot 0.6.x API (SOFollower / SOLeader).
+"""main.py — read ALL data (camera frames + motor positions) from a
+LeRobot SO-101 follower arm as a plain Python dict, then send it to an
+OpenPI-compatible inference endpoint.
 
 Modes
     Read-only:
-        uv run src/robot_hackathon/read_so101.py
+        uv run src/robot_hackathon/main.py
 
     Teleop with the leader arm:
-        uv run src/robot_hackathon/read_so101.py --teleop
+        uv run src/robot_hackathon/main.py --teleop
 
-    Remote policy:
-        uv run src/robot_hackathon/read_so101.py \
-            --policy-url http://127.0.0.1:8000 \
+    Remote OpenPI inference:
+        uv run src/robot_hackathon/main.py \
+            --inference-url http://127.0.0.1:8000 \
             --policy-task "pick up the red cube"
+
+    Log observations to another endpoint:
+        uv run src/robot_hackathon/main.py \
+            --data-url http://127.0.0.1:9000/data
 
 Calibration is specified as a file, e.g.
     --follower-calib-file ~/.cache/huggingface/lerobot/my_follower/calibration.json
@@ -23,7 +26,7 @@ Data dict (every loop iteration):
     "timestamp": 1732145.123,
     "motors":  {"shoulder_pan": float, ...},
     "cameras": {"top": np.ndarray(H, W, 3) uint8 RGB},
-    "action":  {"shoulder_pan.pos": float, ...}   # teleop/policy only
+    "action":  {"shoulder_pan.pos": float, ...}   # teleop/inference only
 }
 """
 
@@ -31,11 +34,22 @@ import argparse
 import base64
 import io
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
-from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
-from lerobot.robots.so_follower import SOFollower, SOFollowerRobotConfig
-from lerobot.teleoperators.so_leader import SOLeader, SOLeaderTeleopConfig
+# LeRobot imports are optional at module-load time.  This lets the script
+# print --help and run in lightweight containers / smoke tests without the
+# heavy robotics stack, while still connecting to real hardware when available.
+try:
+    from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
+    from lerobot.robots.so_follower import SOFollower, SOFollowerRobotConfig
+    from lerobot.teleoperators.so_leader import SOLeader, SOLeaderTeleopConfig
+
+    _LEROBOT_IMPORT_ERROR = None
+except ImportError as _lerobot_err:  # pragma: no cover
+    OpenCVCameraConfig = SOFollower = SOFollowerRobotConfig = None
+    SOLeader = SOLeaderTeleopConfig = None
+    _LEROBOT_IMPORT_ERROR = _lerobot_err
 
 # ----------------------------- configuration --------------------------------
 FOLLOWER_PORT = "/dev/ttyACM0"  # follower arm  (Windows: "COM3")
@@ -48,9 +62,18 @@ DEFAULT_CALIB_ROOT = Path.home() / ".cache" / "huggingface" / "lerobot"
 FOLLOWER_CALIB_FILE = DEFAULT_CALIB_ROOT / FOLLOWER_ID / "calibration.json"
 LEADER_CALIB_FILE = DEFAULT_CALIB_ROOT / LEADER_ID / "calibration.json"
 
+
+@dataclass
+class CameraCfg:
+    index_or_path: int | str
+    width: int
+    height: int
+    fps: int
+
+
 CAMERAS = {
     # dict key = key in the returned data dict
-    "top": OpenCVCameraConfig(index_or_path=0, width=640, height=480, fps=30),
+    "top": CameraCfg(index_or_path=0, width=640, height=480, fps=30),
 }
 
 FPS = 30
@@ -109,9 +132,24 @@ def _build_config(cfg_cls, base_kwargs, calib_file: Path | None):
 
 
 def connect_follower(calib_file: Path | None = None) -> SOFollower:
+    if SOFollower is None:
+        raise RuntimeError(
+            "lerobot is required to connect to the real follower arm."
+        ) from _LEROBOT_IMPORT_ERROR
+
+    lerobot_cameras = {
+        name: OpenCVCameraConfig(
+            index_or_path=c.index_or_path,
+            width=c.width,
+            height=c.height,
+            fps=c.fps,
+        )
+        for name, c in CAMERAS.items()
+    }
+
     cfg = _build_config(
         SOFollowerRobotConfig,
-        {"port": FOLLOWER_PORT, "id": FOLLOWER_ID, "cameras": CAMERAS},
+        {"port": FOLLOWER_PORT, "id": FOLLOWER_ID, "cameras": lerobot_cameras},
         calib_file,
     )
     robot = SOFollower(cfg)
@@ -128,6 +166,11 @@ def connect_follower(calib_file: Path | None = None) -> SOFollower:
 
 
 def connect_leader(calib_file: Path | None = None) -> SOLeader:
+    if SOLeader is None:
+        raise RuntimeError(
+            "lerobot is required to connect to the real leader arm."
+        ) from _LEROBOT_IMPORT_ERROR
+
     cfg = _build_config(
         SOLeaderTeleopConfig,
         {"port": LEADER_PORT, "id": LEADER_ID},
@@ -150,61 +193,117 @@ def snapshot(robot: SOFollower) -> dict:
     return data
 
 
+# --------------------------------------------------------------------------- #
+#  OpenPI-compatible data formatting & network clients                        #
+# --------------------------------------------------------------------------- #
+
+
+def encode_image(rgb) -> str:
+    """Encode an RGB numpy array as a base64 JPEG string."""
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.fromarray(rgb).save(buf, format="JPEG", quality=85)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def format_for_openpi(data: dict, task: str = "") -> dict:
+    """
+    Convert the internal `data` dict into the JSON schema expected by an
+    OpenPI inference server:
+
+        {
+            "observation": {
+                "state":  [6 floats in JOINT_ORDER],
+                "images": {"top": "<base64 JPEG>", ...}
+            },
+            "prompt": "<language instruction>"
+        }
+    """
+    return {
+        "observation": {
+            "state": [float(data["motors"][j]) for j in JOINT_ORDER],
+            "images": {
+                name: encode_image(frame) for name, frame in data["cameras"].items()
+            },
+        },
+        "prompt": task,
+    }
+
+
 class PolicyClient:
     """
-    Thin REST client for an inference server hosting pi05_base.
-    Server contract (adapt `endpoint` / keys here if your server differs):
+    Thin REST client for an OpenPI-compatible inference server.
+
+    Server contract:
         POST {base_url}/act
-        request : {
-            "model":  "pi05_base",
-            "task":   "<language instruction>",
-            "motors": {"shoulder_pan": float, ...},
-            "images": {"top": "<base64-encoded JPEG, RGB>", ...}
-        }
-        response: {"action": {"shoulder_pan.pos": float, ...}}
-                  or {"action": [float, ...]} in JOINT_ORDER
+        request : format_for_openpi(data, task)
+        response: {"action": <list or dict>}
     """
 
     def __init__(self, base_url: str, model: str, task: str, timeout: float = 1.0):
-        import requests  # lazy import: policy mode is off by default
+        import requests  # lazy import: inference mode is off by default
 
         self._requests = requests
         self._session = requests.Session()
         self.endpoint = base_url.rstrip("/") + "/act"
-        self.model = model
+        self.model = model  # kept for CLI compatibility; not sent to OpenPI
         self.task = task
         self.timeout = timeout
 
-    @staticmethod
-    def _encode_image(rgb) -> str:
-        from PIL import Image
-
-        buf = io.BytesIO()
-        Image.fromarray(rgb).save(buf, format="JPEG", quality=85)
-        return base64.b64encode(buf.getvalue()).decode("ascii")
-
     def get_action(self, data: dict) -> dict | None:
         """Send observation, receive action. Returns None on failure (arm holds position)."""
-        payload = {
-            "model": self.model,
-            "task": self.task,
-            "motors": data["motors"],
-            "images": {
-                name: self._encode_image(frame)
-                for name, frame in data["cameras"].items()
-            },
-        }
+        payload = format_for_openpi(data, self.task)
         try:
             r = self._session.post(self.endpoint, json=payload, timeout=self.timeout)
             r.raise_for_status()
         except self._requests.RequestException as e:
-            print(f"\n[policy] request failed: {e} — holding position")
+            print(f"\n[policy] {self.endpoint} request failed: {e} — holding position")
             return None
 
-        action = r.json()["action"]
+        resp = r.json()
+        if not isinstance(resp, dict) or "action" not in resp:
+            print("\n[policy] response did not contain 'action' — holding position")
+            return None
+
+        return self._parse_action(resp["action"])
+
+    def _parse_action(self, action) -> dict:
+        """Accept a dict of joint actions or a list/array of floats."""
         if isinstance(action, dict):
             return {k: float(v) for k, v in action.items()}
+
+        # OpenPI may return an action chunk: [[step0], [step1], ...]
+        if isinstance(action, list) and len(action) and isinstance(action[0], list):
+            action = action[0]
+
         return {f"{j}.pos": float(v) for j, v in zip(JOINT_ORDER, action)}
+
+
+class DataClient:
+    """
+    Fire-and-forget client that POSTs every processed observation to a
+    remote endpoint (logger, dataset collector, etc.).
+    """
+
+    def __init__(self, base_url: str, task: str = "", timeout: float = 1.0):
+        import requests
+
+        self._requests = requests
+        self._session = requests.Session()
+        self.endpoint = base_url.rstrip("/") + "/data"
+        self.task = task
+        self.timeout = timeout
+
+    def send(self, data: dict) -> dict | None:
+        payload = format_for_openpi(data, self.task)
+        try:
+            r = self._session.post(self.endpoint, json=payload, timeout=self.timeout)
+            r.raise_for_status()
+            return r.json()
+        except self._requests.RequestException as e:
+            print(f"\n[data] {self.endpoint} request failed: {e}")
+            return None
 
 
 def main():
@@ -216,17 +315,38 @@ def main():
         action="store_true",
         help="drive the follower with the leader arm while logging",
     )
+
+    # --- URL for sending data to an OpenPI-compatible inference server ---
     p.add_argument(
-        "--policy-url",
+        "--inference-url",
+        "--policy-url",  # legacy alias
+        dest="inference_url",
         default=None,
-        help="base URL of a REST policy server (pi05_base). Disabled when omitted.",
+        help="base URL of an OpenPI-compatible inference server, e.g. http://127.0.0.1:8000",
     )
-    p.add_argument("--policy-model", default="pi05_base")
+    p.add_argument(
+        "--policy-model",
+        default="pi05_base",
+        help="model name (kept for CLI compatibility; not used by OpenPI)",
+    )
     p.add_argument(
         "--policy-task",
         default="",
-        help="language instruction sent to the policy (VLA models need one)",
+        help="language instruction sent to the inference endpoint (VLA models need one)",
     )
+
+    # --- optional second URL to log observations ---
+    p.add_argument(
+        "--data-url",
+        default=None,
+        help="base URL to which every processed observation is POSTed (/data)",
+    )
+    p.add_argument(
+        "--data-task",
+        default="",
+        help="language prompt included in --data-url payloads",
+    )
+
     p.add_argument("--fps", type=float, default=FPS)
 
     # ---- explicit calibration files ----
@@ -250,18 +370,21 @@ def main():
 
     robot = connect_follower(args.follower_calib_file)
 
-    policy, leader = None, None
-    if args.policy_url:
-        policy = PolicyClient(args.policy_url, args.policy_model, args.policy_task)
-        print(
-            f"Policy mode: POST {policy.endpoint} (model={policy.model}, task={policy.task!r})"
-        )
+    policy, leader, data_client = None, None, None
+
+    if args.inference_url:
+        policy = PolicyClient(args.inference_url, args.policy_model, args.policy_task)
+        print(f"Inference mode: POST {policy.endpoint} (task={policy.task!r})")
         if args.teleop:
             print(
-                "NOTE: --teleop ignored while --policy-url is set (policy has control)."
+                "NOTE: --teleop ignored while --inference-url is set (policy has control)."
             )
     elif args.teleop:
         leader = connect_leader(args.leader_calib_file)
+
+    if args.data_url:
+        data_client = DataClient(args.data_url, args.data_task or args.policy_task)
+        print(f"Data logging: POST {data_client.endpoint}")
 
     period = 1.0 / args.fps
     print("Reading data... Ctrl+C to stop.")
@@ -279,12 +402,16 @@ def main():
             elif leader is not None:
                 action = {k: float(v) for k, v in leader.get_action().items()}
                 robot.send_action(action)
+
+            if data_client is not None:
+                data_client.send(data)
+
             if action is not None:
                 data["action"] = action
 
             motors = "  ".join(f"{k}={v:7.2f}" for k, v in data["motors"].items())
             cams = "  ".join(f"{k}:{v.shape}" for k, v in data["cameras"].items())
-            mode = "policy" if policy else ("teleop" if leader else "read-only")
+            mode = "inference" if policy else ("teleop" if leader else "read-only")
             print(
                 f"\r[{mode}] motors | {motors}   cams | {cams}   ", end="", flush=True
             )

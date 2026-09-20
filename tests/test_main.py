@@ -1,15 +1,15 @@
 """
-test_read_so101.py — test read_so101.py with the SO-101 hardware mocked out.
+test_main.py — test main.py with the SO-101 hardware mocked out.
 
 No real robot / leader arm / camera / serial port is touched:
   - SOFollower and SOLeader are replaced by fakes at the module boundary
     (they assert the configured ports FOLLOWER_PORT / LEADER_PORT are used)
-  - the pi05_base policy REST API is replaced by a real local HTTP server
+  - the OpenPI inference endpoint is replaced by a real local HTTP server
     on an ephemeral port
 
 Run:
     uv add --dev pytest        # once
-    uv run pytest tests/test_read_so101.py -v
+    uv run pytest tests/test_main.py -v
 """
 
 import base64
@@ -17,6 +17,7 @@ import json
 import math
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -28,13 +29,8 @@ except ImportError:
     import importlib.util
     from pathlib import Path
 
-    _path = (
-        Path(__file__).resolve().parents[1]
-        / "src"
-        / "robot_hackathon"
-        / "read_so101.py"
-    )
-    _spec = importlib.util.spec_from_file_location("read_so101", _path)
+    _path = Path(__file__).resolve().parents[1] / "src" / "robot_hackathon" / "main.py"
+    _spec = importlib.util.spec_from_file_location("main", _path)
     m = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(m)
 
@@ -117,7 +113,7 @@ class MockSO101Leader:
 
 @pytest.fixture
 def mock_hw(monkeypatch):
-    """Patch SOFollower/SOLeader inside read_so101 so no serial port is opened."""
+    """Patch SOFollower/SOLeader inside main.py so no serial port is opened."""
     created = {}
 
     def follower_factory(config):
@@ -135,7 +131,7 @@ def mock_hw(monkeypatch):
 
 def run_main(monkeypatch, argv, iterations=3):
     """Run m.main() for `iterations` loop passes, then stop via KeyboardInterrupt."""
-    monkeypatch.setattr("sys.argv", ["read_so101.py", *argv])
+    monkeypatch.setattr("sys.argv", ["main.py", *argv])
     real_snapshot = m.snapshot
     calls = {"n": 0}
 
@@ -159,14 +155,23 @@ class MockPolicyServer(HTTPServer):
 
 
 class PolicyHandler(BaseHTTPRequestHandler):
-    """Mock pi05_base REST server: validates the request, returns action=1.0 everywhere."""
+    """Mock OpenPI REST server: validates the OpenPI schema, returns an action."""
 
-    server: MockPolicyServer  # set by the server on each request; tells type checkers the type
+    server: MockPolicyServer  # type hint for the concrete server class
 
     def do_POST(self):
         assert self.path == "/act", f"unexpected path {self.path}"
         payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         self.server.received.append(payload)
+
+        # Validate OpenPI observation schema.
+        assert "observation" in payload, payload
+        assert "prompt" in payload, payload
+        obs = payload["observation"]
+        assert "state" in obs and "images" in obs, obs
+        assert len(obs["state"]) == len(JOINTS)
+        assert set(obs["images"]) == {"top"}
+
         body = json.dumps({"action": {f"{j}.pos": 1.0 for j in JOINTS}}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -194,7 +199,7 @@ def policy_server():
 
 
 def test_snapshot_returns_full_dict():
-    cfg = m.SOFollowerRobotConfig(port=m.FOLLOWER_PORT, id="test", cameras=m.CAMERAS)
+    cfg = SimpleNamespace(port=m.FOLLOWER_PORT, id="test", cameras=m.CAMERAS)
     robot = MockSO101Follower(cfg)
     robot.connect()
 
@@ -205,7 +210,10 @@ def test_snapshot_returns_full_dict():
     assert set(data["motors"]) == set(JOINTS)
     assert all(isinstance(v, float) for v in data["motors"].values())
     frame = data["cameras"]["top"]
-    assert frame.shape == (480, 640, 3) and frame.dtype == np.uint8
+    assert (
+        frame.shape == (m.CAMERAS["top"].height, m.CAMERAS["top"].width, 3)
+        and frame.dtype == np.uint8
+    )
 
 
 def test_read_only_mode(mock_hw, monkeypatch):
@@ -230,31 +238,50 @@ def test_teleop_mode(mock_hw, monkeypatch):
         assert all(isinstance(v, float) for v in action.values())
 
 
-def test_policy_mode(mock_hw, monkeypatch, policy_server):
+def test_inference_mode(mock_hw, monkeypatch, policy_server):
     url, received = policy_server
     run_main(
         monkeypatch,
-        argv=["--policy-url", url, "--policy-task", "pick the cube"],
+        argv=["--inference-url", url, "--policy-task", "pick the cube"],
         iterations=3,
     )
 
     robot = mock_hw["robot"]
     assert len(robot.sent_actions) == 3
     assert all(a["shoulder_pan.pos"] == 1.0 for a in robot.sent_actions)
-    assert "leader" not in mock_hw  # policy mode doesn't touch the leader
+    assert "leader" not in mock_hw  # inference mode doesn't touch the leader
 
     assert len(received) == 3
     payload = received[0]
-    assert payload["model"] == "pi05_base"
-    assert payload["task"] == "pick the cube"
-    assert set(payload["motors"]) == set(JOINTS)
-    assert set(payload["images"]) == {"top"}
-    jpeg = base64.b64decode(payload["images"]["top"])
+
+    # OpenPI schema
+    assert payload["prompt"] == "pick the cube"
+    assert "observation" in payload
+    obs = payload["observation"]
+    assert set(obs["images"]) == {"top"}
+    assert len(obs["state"]) == len(JOINTS)
+    assert all(isinstance(v, float) for v in obs["state"])
+
+    jpeg = base64.b64decode(obs["images"]["top"])
     assert jpeg[:2] == b"\xff\xd8"  # JPEG magic bytes
 
 
-def test_policy_client_parses_list_action(monkeypatch):
-    """Server may also return a plain 6-float list instead of a dict."""
+def test_format_for_openpi():
+    data = {
+        "timestamp": 123.0,
+        "motors": {j: float(i) for i, j in enumerate(JOINTS)},
+        "cameras": {"top": np.zeros((4, 4, 3), dtype=np.uint8)},
+    }
+    payload = m.format_for_openpi(data, task="do something")
+
+    assert payload["prompt"] == "do something"
+    assert payload["observation"]["state"] == [float(i) for i in range(len(JOINTS))]
+    assert set(payload["observation"]["images"]) == {"top"}
+    assert isinstance(payload["observation"]["images"]["top"], str)
+
+
+def test_policy_client_parses_list_action_chunk(monkeypatch):
+    """Server may return a plain 6-float list or an action chunk [[6 floats], ...]."""
     client = m.PolicyClient("http://unused", model="pi05_base", task="x")
 
     class FakeResp:
@@ -262,10 +289,15 @@ def test_policy_client_parses_list_action(monkeypatch):
             pass
 
         def json(self):
-            return {"action": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]}
+            return {"action": [[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]]}
 
     monkeypatch.setattr(client._session, "post", lambda *a, **k: FakeResp())
-    action = client.get_action({"motors": {}, "cameras": {}})
+    action = client.get_action(
+        {
+            "motors": {j: 0.0 for j in JOINTS},
+            "cameras": {"top": np.zeros((2, 2, 3), dtype=np.uint8)},
+        }
+    )
     assert action == {f"{j}.pos": float(v) for j, v in zip(JOINTS, range(1, 7))}
 
 
