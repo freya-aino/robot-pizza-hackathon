@@ -1,0 +1,27 @@
+[project]
+name = "robot-hackathon"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "freya", email = "freya.aino@pm.me" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "lerobot[feetech]>=0.6.1",
+    "opencv-python>=5.0.0.93",
+    "pylibdmtx>=0.1.10",
+]
+
+[project.scripts]
+robot-hackathon = "robot_hackathon:main"
+
+[build-system]
+requires = ["uv_build>=0.12.11,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.16.8",
+]
